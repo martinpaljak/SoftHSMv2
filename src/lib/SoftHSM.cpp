@@ -775,6 +775,7 @@ CK_RV SoftHSM::C_GetMechanismList(CK_SLOT_ID slotID, CK_MECHANISM_TYPE_PTR pMech
 		CKM_EC_EDWARDS_KEY_PAIR_GEN,
 		CKM_EDDSA,
 #endif
+		CKM_XOR_BASE_AND_DATA,
 	};
 
 	if (!isInitialised) return CKR_CRYPTOKI_NOT_INITIALIZED;
@@ -1187,6 +1188,11 @@ CK_RV SoftHSM::C_GetMechanismInfo(CK_SLOT_ID slotID, CK_MECHANISM_TYPE type, CK_
 			pInfo->flags = CKF_SIGN | CKF_VERIFY;
 			break;
 #endif
+		case CKM_XOR_BASE_AND_DATA:
+                        pInfo->ulMinKeySize = 16;
+                        pInfo->ulMaxKeySize = 512;
+                        pInfo->flags = CKF_DERIVE;
+                        break;
 		default:
 			DEBUG_MSG("The selected mechanism is not supported");
 			return CKR_MECHANISM_INVALID;
@@ -6881,6 +6887,7 @@ CK_RV SoftHSM::C_DeriveKey
 		case CKM_DES3_CBC_ENCRYPT_DATA:
 		case CKM_AES_ECB_ENCRYPT_DATA:
 		case CKM_AES_CBC_ENCRYPT_DATA:
+		case CKM_XOR_BASE_AND_DATA:
 			break;
 
 		default:
@@ -6916,6 +6923,7 @@ CK_RV SoftHSM::C_DeriveKey
 	// Check if the specified mechanism is allowed for the key
 	if (!isMechanismPermitted(key, pMechanism))
 		return CKR_MECHANISM_INVALID;
+
 
 	// Extract information from the template that is needed to create the object.
 	CK_OBJECT_CLASS objClass;
@@ -6991,7 +6999,8 @@ CK_RV SoftHSM::C_DeriveKey
 	    pMechanism->mechanism == CKM_DES3_ECB_ENCRYPT_DATA ||
 	    pMechanism->mechanism == CKM_DES3_CBC_ENCRYPT_DATA ||
 	    pMechanism->mechanism == CKM_AES_ECB_ENCRYPT_DATA ||
-	    pMechanism->mechanism == CKM_AES_CBC_ENCRYPT_DATA)
+	    pMechanism->mechanism == CKM_AES_CBC_ENCRYPT_DATA ||
+	    pMechanism->mechanism == CKM_XOR_BASE_AND_DATA)
 	{
 		// Check key class and type
 		CK_KEY_TYPE baseKeyType = key->getUnsignedLongValue(CKA_KEY_TYPE, CKK_VENDOR_DEFINED);
@@ -7015,7 +7024,6 @@ CK_RV SoftHSM::C_DeriveKey
 		if (pMechanism->mechanism == CKM_AES_CBC_ENCRYPT_DATA &&
 		    baseKeyType != CKK_AES)
 			return CKR_KEY_TYPE_INCONSISTENT;
-
 		return this->deriveSymmetric(hSession, pMechanism, hBaseKey, pTemplate, ulCount, phKey, keyType, isOnToken, isPrivate);
 	}
 
@@ -10998,6 +11006,21 @@ CK_RV SoftHSM::deriveSymmetric
 		       pData,
 		       length);
 	}
+	else if ((pMechanism->mechanism == CKM_XOR_BASE_AND_DATA) &&
+		  pMechanism->ulParameterLen == sizeof(CK_KEY_DERIVATION_STRING_DATA))
+	{
+		CK_BYTE_PTR pData = CK_KEY_DERIVATION_STRING_DATA_PTR(pMechanism->pParameter)->pData;
+		CK_ULONG ulLen = CK_KEY_DERIVATION_STRING_DATA_PTR(pMechanism->pParameter)->ulLen;
+		if (ulLen == 0 || pData == NULL_PTR)
+		{
+			DEBUG_MSG("There must be data in the parameter");
+			return CKR_MECHANISM_PARAM_INVALID;
+		}
+		data.resize(ulLen);
+		memcpy(&data[0],
+		       pData,
+		       ulLen);
+	}
 	else
 	{
 		DEBUG_MSG("pParameter is invalid");
@@ -11013,6 +11036,7 @@ CK_RV SoftHSM::deriveSymmetric
 	Token* token = session->getToken();
 	if (token == NULL)
 		return CKR_GENERAL_ERROR;
+
 
 	// Extract desired parameter information
 	size_t byteLen = 0;
@@ -11141,6 +11165,10 @@ CK_RV SoftHSM::deriveSymmetric
 			       &(CK_AES_CBC_ENCRYPT_DATA_PARAMS_PTR(pMechanism->pParameter)->iv[0]),
 			       16);
 			break;
+		case CKM_XOR_BASE_AND_DATA:
+			// We do nothing, just to fit into the current code layout
+			algo = SymAlgo::AES; // mostly a NOOP
+			break;
 		default:
 			return CKR_MECHANISM_INVALID;
 	}
@@ -11164,36 +11192,60 @@ CK_RV SoftHSM::deriveSymmetric
 	// adjust key bit length
 	secretkey->setBitLen(secretkey->getKeyBits().size() * bb);
 
-	// Initialize encryption
-	if (!cipher->encryptInit(secretkey, mode, iv, padding))
-	{
-		cipher->recycleKey(secretkey);
-		CryptoFactory::i()->recycleSymmetricAlgorithm(cipher);
-		return CKR_MECHANISM_INVALID;
-	}
-
 	// Get the data
 	ByteString secretValue;
 
-	// Encrypt the data
-	if (!cipher->encryptUpdate(data, secretValue))
-	{
-		cipher->recycleKey(secretkey);
-		CryptoFactory::i()->recycleSymmetricAlgorithm(cipher);
-		return CKR_GENERAL_ERROR;
-	}
+	if (pMechanism->mechanism == CKM_XOR_BASE_AND_DATA) {
+		// Get the key data to XOR
+		ByteString keydata;
+		if (isPrivate)
+		{
+			bool bOK = token->decrypt(baseKey->getByteStringValue(CKA_VALUE), keydata);
+			if (!bOK) return CKR_GENERAL_ERROR;
+		}
+		else
+		{
+			keydata = baseKey->getByteStringValue(CKA_VALUE);
+		}
 
-	// Finalize encryption
-	ByteString encryptedFinal;
-	if (!cipher->encryptFinal(encryptedFinal))
-	{
+		if (keydata.size() != data.size())
+			return CKR_MECHANISM_PARAM_INVALID;
+
+		secretValue.resize(secretkey->getKeyBits().size());
+
+		// XOR keydata to become new data SIIN
+		for (unsigned int i=0; i < secretValue.size(); i++)
+			secretValue[i] = keydata[i] ^ data[i];
+	} else {
+		// Initialize encryption
+		if (!cipher->encryptInit(secretkey, mode, iv, padding))
+		{
+			cipher->recycleKey(secretkey);
+			CryptoFactory::i()->recycleSymmetricAlgorithm(cipher);
+			return CKR_MECHANISM_INVALID;
+		}
+
+		// Encrypt the data
+		if (!cipher->encryptUpdate(data, secretValue))
+		{
+			cipher->recycleKey(secretkey);
+			CryptoFactory::i()->recycleSymmetricAlgorithm(cipher);
+			return CKR_GENERAL_ERROR;
+		}
+
+		// Finalize encryption
+		ByteString encryptedFinal;
+		if (!cipher->encryptFinal(encryptedFinal))
+		{
+			cipher->recycleKey(secretkey);
+			CryptoFactory::i()->recycleSymmetricAlgorithm(cipher);
+			return CKR_GENERAL_ERROR;
+		}
 		cipher->recycleKey(secretkey);
 		CryptoFactory::i()->recycleSymmetricAlgorithm(cipher);
-		return CKR_GENERAL_ERROR;
+
+		secretValue += encryptedFinal;
 	}
-	cipher->recycleKey(secretkey);
-	CryptoFactory::i()->recycleSymmetricAlgorithm(cipher);
-	secretValue += encryptedFinal;
 
 	// Create the secret object using C_CreateObject
 	const CK_ULONG maxAttribs = 32;
