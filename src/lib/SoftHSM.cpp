@@ -776,6 +776,9 @@ CK_RV SoftHSM::C_GetMechanismList(CK_SLOT_ID slotID, CK_MECHANISM_TYPE_PTR pMech
 		CKM_EDDSA,
 #endif
 		CKM_XOR_BASE_AND_DATA,
+		CKM_CONCATENATE_BASE_AND_DATA,
+		CKM_CONCATENATE_DATA_AND_BASE,
+		CKM_CONCATENATE_BASE_AND_KEY
 	};
 
 	if (!isInitialised) return CKR_CRYPTOKI_NOT_INITIALIZED;
@@ -1028,8 +1031,8 @@ CK_RV SoftHSM::C_GetMechanismInfo(CK_SLOT_ID slotID, CK_MECHANISM_TYPE type, CK_
 		case CKM_DES_CBC_PAD:
 #endif
 		case CKM_DES3_CBC:
-			pInfo->flags = CKF_WRAP;
 		case CKM_DES3_ECB:
+			pInfo->flags = CKF_WRAP | CKF_UNWRAP;
 		case CKM_DES3_CBC_PAD:
 			// Key size is not in use
 			pInfo->ulMinKeySize = 0;
@@ -1048,7 +1051,7 @@ CK_RV SoftHSM::C_GetMechanismInfo(CK_SLOT_ID slotID, CK_MECHANISM_TYPE type, CK_
 			pInfo->flags = CKF_GENERATE;
 			break;
 		case CKM_AES_CBC:
-			pInfo->flags = CKF_WRAP;
+			pInfo->flags = CKF_WRAP | CKF_UNWRAP;
 		case CKM_AES_ECB:
 		case CKM_AES_CBC_PAD:
 		case CKM_AES_CTR:
@@ -1189,6 +1192,21 @@ CK_RV SoftHSM::C_GetMechanismInfo(CK_SLOT_ID slotID, CK_MECHANISM_TYPE type, CK_
 			break;
 #endif
 		case CKM_XOR_BASE_AND_DATA:
+                        pInfo->ulMinKeySize = 16;
+                        pInfo->ulMaxKeySize = 512;
+                        pInfo->flags = CKF_DERIVE;
+                        break;
+		case CKM_CONCATENATE_BASE_AND_DATA:
+                        pInfo->ulMinKeySize = 16;
+                        pInfo->ulMaxKeySize = 512;
+                        pInfo->flags = CKF_DERIVE;
+                        break;
+		case CKM_CONCATENATE_DATA_AND_BASE:
+                        pInfo->ulMinKeySize = 16;
+                        pInfo->ulMaxKeySize = 512;
+                        pInfo->flags = CKF_DERIVE;
+                        break;
+		case CKM_CONCATENATE_BASE_AND_KEY:
                         pInfo->ulMinKeySize = 16;
                         pInfo->ulMaxKeySize = 512;
                         pInfo->flags = CKF_DERIVE;
@@ -5976,6 +5994,8 @@ CK_RV SoftHSM::WrapKeySym
 	// Get the symmetric algorithm matching the mechanism
 	SymAlgo::Type algo = SymAlgo::Unknown;
 	SymWrap::Type mode = SymWrap::Unknown;
+	SymMode::Type encmode = SymMode::CBC;
+
 	size_t bb = 8;
 #ifdef HAVE_AES_KEY_WRAP
 	CK_ULONG wrappedlen = keydata.size();
@@ -6011,6 +6031,12 @@ CK_RV SoftHSM::WrapKeySym
 			break;
 		case CKM_DES3_CBC:
 			algo = SymAlgo::DES3;
+			bb = 7;
+			break;
+		case CKM_DES3_ECB:
+			algo = SymAlgo::DES3;
+			encmode = SymMode::ECB;
+			bb = 7;
 			break;
 		default:
 			return CKR_MECHANISM_INVALID;
@@ -6024,7 +6050,8 @@ CK_RV SoftHSM::WrapKeySym
 	{
 		cipher->recycleKey(wrappingkey);
 		CryptoFactory::i()->recycleSymmetricAlgorithm(cipher);
-		return CKR_GENERAL_ERROR;
+		return CKR_MECHANISM_INVALID;
+		//return CKR_GENERAL_ERROR;
 	}
 
 	// adjust key bit length
@@ -6039,11 +6066,12 @@ CK_RV SoftHSM::WrapKeySym
 	} else if (pMechanism->mechanism == CKM_DES3_CBC){
 		iv.resize(8);
 		memcpy(&iv[0], pMechanism->pParameter, 8);
+	} else {
+		iv.resize(0);
 	}
 	switch(pMechanism->mechanism) {
 
 		case CKM_AES_CBC:
-		case CKM_DES3_CBC:
 			if (!cipher->encryptInit(wrappingkey, SymMode::CBC, iv, false))
 			{
 				cipher->recycleKey(wrappingkey);
@@ -6067,6 +6095,11 @@ CK_RV SoftHSM::WrapKeySym
 			break;
 		default:
 			// Wrap the key
+			if (!cipher->encryptInit(wrappingkey, encmode, iv, false)) {
+				cipher->recycleKey(wrappingkey);
+				CryptoFactory::i()->recycleSymmetricAlgorithm(cipher);
+				return CKR_ATTRIBUTE_TYPE_INVALID;
+			}
 			if (!cipher->wrapKey(wrappingkey, mode, keydata, wrapped))
 			{
 				cipher->recycleKey(wrappingkey);
@@ -6215,6 +6248,17 @@ CK_RV SoftHSM::C_WrapKey
                             pMechanism->ulParameterLen != 16)
                                 return CKR_ARGUMENTS_BAD;
                         break;
+		case CKM_DES3_CBC:
+			// FIXME: not exposed
+			if (pMechanism->pParameter == NULL_PTR ||
+                            pMechanism->ulParameterLen != 8)
+                                return CKR_ARGUMENTS_BAD;
+			break;
+		case CKM_DES3_ECB:
+			if (pMechanism->pParameter != NULL_PTR ||
+                            pMechanism->ulParameterLen != 0)
+				return CKR_ARGUMENTS_BAD;
+			break;
 		default:
 			return CKR_MECHANISM_INVALID;
 	}
@@ -6253,9 +6297,10 @@ CK_RV SoftHSM::C_WrapKey
 		return CKR_WRAPPING_KEY_TYPE_INCONSISTENT;
 	if (pMechanism->mechanism == CKM_AES_CBC && wrapKey->getUnsignedLongValue(CKA_KEY_TYPE, CKK_VENDOR_DEFINED) != CKK_AES)
 		return CKR_WRAPPING_KEY_TYPE_INCONSISTENT;
-	if (pMechanism->mechanism == CKM_DES3_CBC && (wrapKey->getUnsignedLongValue(CKA_KEY_TYPE, CKK_VENDOR_DEFINED) != CKK_DES2 ||
-		wrapKey->getUnsignedLongValue(CKA_KEY_TYPE, CKK_VENDOR_DEFINED) != CKK_DES3))
-		return CKR_WRAPPING_KEY_TYPE_INCONSISTENT;
+	// MRTN FIXME: key lookup by right type
+	//if ((pMechanism->mechanism == CKM_DES3_CBC || pMechanism->mechanism == CKM_DES3_ECB) && !(wrapKey->getUnsignedLongValue(CKA_KEY_TYPE, CKK_VENDOR_DEFINED) == CKK_DES2 ||
+	//	wrapKey->getUnsignedLongValue(CKA_KEY_TYPE, CKK_VENDOR_DEFINED) == CKK_DES3))
+	//	return CKR_WRAPPING_KEY_TYPE_INCONSISTENT;
 
 	// Check if the wrapping key can be used for wrapping
 	if (wrapKey->getBooleanValue(CKA_WRAP, false) == false)
@@ -6447,6 +6492,8 @@ CK_RV SoftHSM::UnwrapKeySym
 	// Get the symmetric algorithm matching the mechanism
 	SymAlgo::Type algo = SymAlgo::Unknown;
 	SymWrap::Type mode = SymWrap::Unknown;
+	SymMode::Type encmode = SymMode::Unknown;
+	
 	size_t bb = 8;
 	switch(pMechanism->mechanism) {
 #ifdef HAVE_AES_KEY_WRAP
@@ -6461,6 +6508,11 @@ CK_RV SoftHSM::UnwrapKeySym
 			mode = SymWrap::AES_KEYWRAP_PAD;
 			break;
 #endif
+		case CKM_DES3_CBC:
+			algo = SymAlgo::DES3;
+			encmode = SymMode::CBC;
+			bb = 7;
+			break;
 		default:
 			return CKR_MECHANISM_INVALID;
 	}
@@ -6479,8 +6531,13 @@ CK_RV SoftHSM::UnwrapKeySym
 	// adjust key bit length
 	unwrappingkey->setBitLen(unwrappingkey->getKeyBits().size() * bb);
 
-	// Unwrap the key
 	CK_RV rv = CKR_OK;
+	// FIXME: parameter
+	if (pMechanism->mechanism == CKM_DES3_CBC) {
+		ByteString iv;
+		iv.resize(8);
+		cipher->decryptInit(unwrappingkey, encmode, iv, false);
+	}
 	if (!cipher->unwrapKey(unwrappingkey, mode, wrapped, keydata))
 		rv = CKR_GENERAL_ERROR;
 	cipher->recycleKey(unwrappingkey);
@@ -6605,7 +6662,10 @@ CK_RV SoftHSM::C_UnwrapKey
 			if (rv != CKR_OK)
 				return rv;
 			break;
-
+		case CKM_DES3_CBC:
+			if ((ulWrappedKeyLen < 8) || ((ulWrappedKeyLen % 8) != 0))
+				return CKR_WRAPPED_KEY_LEN_RANGE;
+			break;
 		default:
 			return CKR_MECHANISM_INVALID;
 	}
@@ -6637,6 +6697,8 @@ CK_RV SoftHSM::C_UnwrapKey
 	if (pMechanism->mechanism == CKM_AES_KEY_WRAP && unwrapKey->getUnsignedLongValue(CKA_KEY_TYPE, CKK_VENDOR_DEFINED) != CKK_AES)
 		return CKR_UNWRAPPING_KEY_TYPE_INCONSISTENT;
 	if (pMechanism->mechanism == CKM_AES_KEY_WRAP_PAD && unwrapKey->getUnsignedLongValue(CKA_KEY_TYPE, CKK_VENDOR_DEFINED) != CKK_AES)
+		return CKR_UNWRAPPING_KEY_TYPE_INCONSISTENT;
+	if (pMechanism->mechanism == CKM_DES3_CBC && !(unwrapKey->getUnsignedLongValue(CKA_KEY_TYPE, CKK_VENDOR_DEFINED) == CKK_DES2 || unwrapKey->getUnsignedLongValue(CKA_KEY_TYPE, CKK_VENDOR_DEFINED) == CKK_DES3))
 		return CKR_UNWRAPPING_KEY_TYPE_INCONSISTENT;
 	if ((pMechanism->mechanism == CKM_RSA_PKCS || pMechanism->mechanism == CKM_RSA_PKCS_OAEP) && unwrapKey->getUnsignedLongValue(CKA_CLASS, CKO_VENDOR_DEFINED) != CKO_PRIVATE_KEY)
 		return CKR_UNWRAPPING_KEY_TYPE_INCONSISTENT;
@@ -6888,6 +6950,9 @@ CK_RV SoftHSM::C_DeriveKey
 		case CKM_AES_ECB_ENCRYPT_DATA:
 		case CKM_AES_CBC_ENCRYPT_DATA:
 		case CKM_XOR_BASE_AND_DATA:
+		case CKM_CONCATENATE_DATA_AND_BASE:
+		case CKM_CONCATENATE_BASE_AND_DATA:
+		case CKM_CONCATENATE_BASE_AND_KEY:
 			break;
 
 		default:
@@ -7000,7 +7065,10 @@ CK_RV SoftHSM::C_DeriveKey
 	    pMechanism->mechanism == CKM_DES3_CBC_ENCRYPT_DATA ||
 	    pMechanism->mechanism == CKM_AES_ECB_ENCRYPT_DATA ||
 	    pMechanism->mechanism == CKM_AES_CBC_ENCRYPT_DATA ||
-	    pMechanism->mechanism == CKM_XOR_BASE_AND_DATA)
+	    pMechanism->mechanism == CKM_XOR_BASE_AND_DATA ||
+	    pMechanism->mechanism == CKM_CONCATENATE_BASE_AND_DATA ||
+	    pMechanism->mechanism == CKM_CONCATENATE_DATA_AND_BASE ||
+	    pMechanism->mechanism == CKM_CONCATENATE_BASE_AND_KEY)
 	{
 		// Check key class and type
 		CK_KEY_TYPE baseKeyType = key->getUnsignedLongValue(CKA_KEY_TYPE, CKK_VENDOR_DEFINED);
@@ -10922,8 +10990,18 @@ CK_RV SoftHSM::deriveSymmetric
 		return CKR_MECHANISM_PARAM_INVALID;
 	}
 
-	ByteString data;
+	// Get the session
+	Session* session = (Session*)handleManager->getSession(hSession);
+	if (session == NULL)
+		return CKR_SESSION_HANDLE_INVALID;
 
+	// Get the token
+	Token* token = session->getToken();
+	if (token == NULL)
+		return CKR_GENERAL_ERROR;
+
+	ByteString data;
+	size_t byteLen = 0;
 	if ((pMechanism->mechanism == CKM_DES_ECB_ENCRYPT_DATA ||
 	    pMechanism->mechanism == CKM_DES3_ECB_ENCRYPT_DATA) &&
 	    pMechanism->ulParameterLen == sizeof(CK_KEY_DERIVATION_STRING_DATA))
@@ -10941,9 +11019,7 @@ CK_RV SoftHSM::deriveSymmetric
 			return CKR_MECHANISM_PARAM_INVALID;
 		}
 		data.resize(ulLen);
-		memcpy(&data[0],
-		       pData,
-		       ulLen);
+		memcpy(&data[0], pData, ulLen);
 	}
 	else if ((pMechanism->mechanism == CKM_DES_CBC_ENCRYPT_DATA ||
 		 pMechanism->mechanism == CKM_DES3_CBC_ENCRYPT_DATA) &&
@@ -10962,9 +11038,7 @@ CK_RV SoftHSM::deriveSymmetric
 			return CKR_MECHANISM_PARAM_INVALID;
 		}
 		data.resize(length);
-		memcpy(&data[0],
-		       pData,
-		       length);
+		memcpy(&data[0], pData, length);
 	}
 	else if (pMechanism->mechanism == CKM_AES_ECB_ENCRYPT_DATA &&
 		 pMechanism->ulParameterLen == sizeof(CK_KEY_DERIVATION_STRING_DATA))
@@ -10982,9 +11056,7 @@ CK_RV SoftHSM::deriveSymmetric
 			return CKR_MECHANISM_PARAM_INVALID;
 		}
 		data.resize(ulLen);
-		memcpy(&data[0],
-		       pData,
-		       ulLen);
+		memcpy(&data[0], pData, ulLen);
 	}
 	else if ((pMechanism->mechanism == CKM_AES_CBC_ENCRYPT_DATA) &&
 		 pMechanism->ulParameterLen == sizeof(CK_AES_CBC_ENCRYPT_DATA_PARAMS))
@@ -11002,11 +11074,11 @@ CK_RV SoftHSM::deriveSymmetric
 			return CKR_MECHANISM_PARAM_INVALID;
 		}
 		data.resize(length);
-		memcpy(&data[0],
-		       pData,
-		       length);
+		memcpy(&data[0], pData, length);
 	}
-	else if ((pMechanism->mechanism == CKM_XOR_BASE_AND_DATA) &&
+	else if ((pMechanism->mechanism == CKM_XOR_BASE_AND_DATA
+	          || pMechanism->mechanism == CKM_CONCATENATE_BASE_AND_DATA
+	          || pMechanism->mechanism == CKM_CONCATENATE_DATA_AND_BASE) &&
 		  pMechanism->ulParameterLen == sizeof(CK_KEY_DERIVATION_STRING_DATA))
 	{
 		CK_BYTE_PTR pData = CK_KEY_DERIVATION_STRING_DATA_PTR(pMechanism->pParameter)->pData;
@@ -11017,9 +11089,31 @@ CK_RV SoftHSM::deriveSymmetric
 			return CKR_MECHANISM_PARAM_INVALID;
 		}
 		data.resize(ulLen);
-		memcpy(&data[0],
-		       pData,
-		       ulLen);
+		byteLen = ulLen; // At least this length it will be, + key size. So that we don't check VALUE_LEN down there.
+		memcpy(&data[0], pData, ulLen);
+	} else if ((pMechanism->mechanism == CKM_CONCATENATE_BASE_AND_KEY) &&
+		  pMechanism->ulParameterLen == sizeof(CK_OBJECT_HANDLE))
+	{
+		CK_OBJECT_HANDLE_PTR pKey = CK_OBJECT_HANDLE_PTR(pMechanism->pParameter);
+		if (pKey == CK_INVALID_HANDLE)
+		{
+			DEBUG_MSG("There must be handle in the parameter");
+			return CKR_MECHANISM_PARAM_INVALID;
+		}
+		DEBUG_MSG("(0x%08X) Other key handle is (0x%08X)", pKey, *pKey);
+
+		// Check the key handle.
+		OSObject *otherKey = (OSObject *)handleManager->getObject(*pKey);
+		if (otherKey == NULL_PTR || !otherKey->isValid()) return CKR_OBJECT_HANDLE_INVALID;
+		if (otherKey->getBooleanValue(CKA_PRIVATE, true))
+		{
+			bool bOK = token->decrypt(otherKey->getByteStringValue(CKA_VALUE), data);
+			if (!bOK) return CKR_GENERAL_ERROR;
+		}
+		else
+		{
+			data = otherKey->getByteStringValue(CKA_VALUE);
+		}
 	}
 	else
 	{
@@ -11027,19 +11121,9 @@ CK_RV SoftHSM::deriveSymmetric
 		return CKR_MECHANISM_PARAM_INVALID;
 	}
 
-	// Get the session
-	Session* session = (Session*)handleManager->getSession(hSession);
-	if (session == NULL)
-		return CKR_SESSION_HANDLE_INVALID;
-
-	// Get the token
-	Token* token = session->getToken();
-	if (token == NULL)
-		return CKR_GENERAL_ERROR;
 
 
 	// Extract desired parameter information
-	size_t byteLen = 0;
 	bool checkValue = true;
 	for (CK_ULONG i = 0; i < ulCount; i++)
 	{
@@ -11092,7 +11176,7 @@ CK_RV SoftHSM::deriveSymmetric
 		case CKK_DES2:
 			if (byteLen != 0)
 			{
-				INFO_MSG("CKA_VALUE_LEN must not be set");
+				INFO_MSG("CKA_VALUE_LEN must not be set %d", byteLen);
 				return CKR_ATTRIBUTE_READ_ONLY;
 			}
 			byteLen = 16;
@@ -11166,8 +11250,11 @@ CK_RV SoftHSM::deriveSymmetric
 			       16);
 			break;
 		case CKM_XOR_BASE_AND_DATA:
+		case CKM_CONCATENATE_BASE_AND_KEY:
+		case CKM_CONCATENATE_BASE_AND_DATA:
+		case CKM_CONCATENATE_DATA_AND_BASE:
 			// We do nothing, just to fit into the current code layout
-			algo = SymAlgo::AES; // mostly a NOOP
+			algo = SymAlgo::AES;
 			break;
 		default:
 			return CKR_MECHANISM_INVALID;
@@ -11195,8 +11282,11 @@ CK_RV SoftHSM::deriveSymmetric
 	// Get the data
 	ByteString secretValue;
 
-	if (pMechanism->mechanism == CKM_XOR_BASE_AND_DATA) {
-		// Get the key data to XOR
+	if (pMechanism->mechanism == CKM_XOR_BASE_AND_DATA
+	    || pMechanism->mechanism == CKM_CONCATENATE_BASE_AND_DATA
+	    || pMechanism->mechanism == CKM_CONCATENATE_DATA_AND_BASE
+		|| pMechanism->mechanism == CKM_CONCATENATE_BASE_AND_KEY) {
+		// Get the key data
 		ByteString keydata;
 		if (isPrivate)
 		{
@@ -11208,14 +11298,32 @@ CK_RV SoftHSM::deriveSymmetric
 			keydata = baseKey->getByteStringValue(CKA_VALUE);
 		}
 
-		if (keydata.size() != data.size())
-			return CKR_MECHANISM_PARAM_INVALID;
+		if (pMechanism->mechanism == CKM_XOR_BASE_AND_DATA) {
+			if (keydata.size() != data.size())
+				return CKR_MECHANISM_PARAM_INVALID;
+			secretValue.resize(secretkey->getKeyBits().size());
 
-		secretValue.resize(secretkey->getKeyBits().size());
-
-		// XOR keydata to become new data SIIN
-		for (unsigned int i=0; i < secretValue.size(); i++)
-			secretValue[i] = keydata[i] ^ data[i];
+			// XOR keydata to become new data
+			for (unsigned int i=0; i < secretValue.size(); i++)
+				secretValue[i] = keydata[i] ^ data[i];
+		} else if (pMechanism->mechanism == CKM_CONCATENATE_BASE_AND_KEY) {
+			secretValue += keydata;
+			secretValue += data;
+			if (byteLen == 0)
+				byteLen = keydata.size() + data.size();
+		} else if (pMechanism->mechanism == CKM_CONCATENATE_BASE_AND_DATA) {
+			secretValue += keydata;
+			secretValue += data;
+			if (byteLen == 0)
+				byteLen = keydata.size() + data.size();
+		} else if (pMechanism->mechanism == CKM_CONCATENATE_DATA_AND_BASE) {
+			secretValue += data;
+			secretValue += keydata;
+			if (byteLen == 0)
+				byteLen = data.size() + keydata.size();
+		} else {
+			 return CKR_GENERAL_ERROR;
+		}
 	} else {
 		// Initialize encryption
 		if (!cipher->encryptInit(secretkey, mode, iv, padding))
@@ -11445,7 +11553,6 @@ CK_RV SoftHSM::CreateObject(CK_SESSION_HANDLE hSession, CK_ATTRIBUTE_PTR pTempla
 			INFO_MSG("User is not authorized");
 		if (rv == CKR_SESSION_READ_ONLY)
 			INFO_MSG("Session is read-only");
-
 		return rv;
 	}
 
