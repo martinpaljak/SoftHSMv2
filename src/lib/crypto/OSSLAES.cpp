@@ -133,6 +133,9 @@ const EVP_CIPHER* OSSLAES::getWrapCipher(const SymWrap::Type mode, const Symmetr
 		};
 	}
 #endif
+	if (getCipher() != NULL) {
+		return getCipher();
+	}
 
 	ERROR_MSG("unknown AES key wrap mode %i", mode);
 	return NULL;

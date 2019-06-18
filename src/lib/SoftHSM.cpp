@@ -6493,7 +6493,7 @@ CK_RV SoftHSM::UnwrapKeySym
 	SymAlgo::Type algo = SymAlgo::Unknown;
 	SymWrap::Type mode = SymWrap::Unknown;
 	SymMode::Type encmode = SymMode::Unknown;
-	
+
 	size_t bb = 8;
 	switch(pMechanism->mechanism) {
 #ifdef HAVE_AES_KEY_WRAP
@@ -6512,6 +6512,10 @@ CK_RV SoftHSM::UnwrapKeySym
 			algo = SymAlgo::DES3;
 			encmode = SymMode::CBC;
 			bb = 7;
+			break;
+		case CKM_AES_CBC:
+			algo = SymAlgo::AES;
+			encmode = SymMode::CBC;
 			break;
 		default:
 			return CKR_MECHANISM_INVALID;
@@ -6536,6 +6540,12 @@ CK_RV SoftHSM::UnwrapKeySym
 	if (pMechanism->mechanism == CKM_DES3_CBC) {
 		ByteString iv;
 		iv.resize(8);
+		cipher->decryptInit(unwrappingkey, encmode, iv, false);
+	}
+	// FIXME: parameter
+	if (pMechanism->mechanism == CKM_AES_CBC) {
+		ByteString iv;
+		iv.resize(16);
 		cipher->decryptInit(unwrappingkey, encmode, iv, false);
 	}
 	if (!cipher->unwrapKey(unwrappingkey, mode, wrapped, keydata))
@@ -6666,6 +6676,10 @@ CK_RV SoftHSM::C_UnwrapKey
 			if ((ulWrappedKeyLen < 8) || ((ulWrappedKeyLen % 8) != 0))
 				return CKR_WRAPPED_KEY_LEN_RANGE;
 			break;
+		case CKM_AES_CBC:
+			if ((ulWrappedKeyLen < 16) || ((ulWrappedKeyLen % 16) != 0))
+				return CKR_WRAPPED_KEY_LEN_RANGE;
+			break;
 		default:
 			return CKR_MECHANISM_INVALID;
 	}
@@ -6699,6 +6713,8 @@ CK_RV SoftHSM::C_UnwrapKey
 	if (pMechanism->mechanism == CKM_AES_KEY_WRAP_PAD && unwrapKey->getUnsignedLongValue(CKA_KEY_TYPE, CKK_VENDOR_DEFINED) != CKK_AES)
 		return CKR_UNWRAPPING_KEY_TYPE_INCONSISTENT;
 	if (pMechanism->mechanism == CKM_DES3_CBC && !(unwrapKey->getUnsignedLongValue(CKA_KEY_TYPE, CKK_VENDOR_DEFINED) == CKK_DES2 || unwrapKey->getUnsignedLongValue(CKA_KEY_TYPE, CKK_VENDOR_DEFINED) == CKK_DES3))
+		return CKR_UNWRAPPING_KEY_TYPE_INCONSISTENT;
+	if (pMechanism->mechanism == CKM_AES_CBC && unwrapKey->getUnsignedLongValue(CKA_KEY_TYPE, CKK_VENDOR_DEFINED) != CKK_AES)
 		return CKR_UNWRAPPING_KEY_TYPE_INCONSISTENT;
 	if ((pMechanism->mechanism == CKM_RSA_PKCS || pMechanism->mechanism == CKM_RSA_PKCS_OAEP) && unwrapKey->getUnsignedLongValue(CKA_CLASS, CKO_VENDOR_DEFINED) != CKO_PRIVATE_KEY)
 		return CKR_UNWRAPPING_KEY_TYPE_INCONSISTENT;
@@ -6754,7 +6770,7 @@ CK_RV SoftHSM::C_UnwrapKey
 	};
 	CK_ULONG secretAttribsCount = 4;
 
-	// Add the additional
+	// Add the additionalu
 	if (ulCount > (maxAttribs - secretAttribsCount))
 		return CKR_TEMPLATE_INCONSISTENT;
 	for (CK_ULONG i = 0; i < ulCount; ++i)
